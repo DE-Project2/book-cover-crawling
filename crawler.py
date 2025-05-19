@@ -2,115 +2,104 @@
 # 분류에 해당하는 field code를 field_list.txt에서 수정 후 파일 실행시킬 것
 
 '''
-pip install selenium
-pip install chromedriver
-pip install beautifulsoup4
-pip install chromedriver_autoinstaller
-pip install requests pillow
+Playwright 기반 교보문고 전체 페이지 이미지 + 엑셀 크롤러
 
-먼저 터미널 또는 아나콘다 프롬프트 또는 둘 다에 설치해주세요.
+실행 전 설치:
+pip install playwright requests beautifulsoup4
+playwright install
 '''
 
-from selenium import webdriver
-from chromedriver_autoinstaller import install as install_chromedriver
-from bs4 import BeautifulSoup
-import time
-import pandas as pd
+import asyncio
 import os
 import requests
+from bs4 import BeautifulSoup
+from playwright.async_api import async_playwright
 
-# 크롬 드라이버 설치 및 실행
-install_chromedriver()
-driver = webdriver.Chrome()
-
-# 폴더 생성
-os.makedirs('images', exist_ok=True)
-os.makedirs('meta_data', exist_ok=True)
-
-# 분류 코드 리스트 로딩
-with open("field_list.txt", "r", encoding="utf-8") as f:
-    field_codes = [line.strip() for line in f if line.strip()]
-
-# 각 분류 코드에 대해 크롤링
-for field_code in field_codes:
+async def crawl_category(field_code, browser, download_dir):
     print(f"\n===== 📚 분류 코드 {field_code} 크롤링 시작 =====")
-    base_url = f"https://product.kyobobook.co.kr/category/KOR/{field_code}#?page={{page}}&type=all&per=50&sort=new"
+    base_url = f"https://product.kyobobook.co.kr/category/KOR/{field_code}#?page={{page}}&type=all&per=50&sort=sel"
 
-    # 첫 페이지 로딩
-    driver.get(base_url.format(page=1))
-    time.sleep(5)
-    soup = BeautifulSoup(driver.page_source, 'html.parser')
+    # 폴더 생성
+    image_dir = f"images/{field_code}"
+    os.makedirs(image_dir, exist_ok=True)
 
-    # 마지막 페이지 번호 추출
+    # Playwright 브라우저 컨텍스트 설정 (엑셀 다운로드 허용)
+    context = await browser.new_context(accept_downloads=True)
+    page = await context.new_page()
+
+    # ✅ 1. 첫 페이지 접속
+    await page.goto(base_url.format(page=1))
+    await page.wait_for_timeout(3000)
+
+    # ✅ 2. 엑셀 다운로드
+    try:
+        async with page.expect_download() as download_info:
+            await page.click('button:has-text("Excel다운로드")')
+        download = await download_info.value
+        save_path = os.path.join(download_dir, f"meta_{field_code}.xlsx")
+        await download.save_as(save_path)
+        print(f"📥 엑셀 저장 완료: {save_path}")
+    except Exception as e:
+        print(f"[❗엑셀 다운로드 오류] {e}")
+
+    # ✅ 3. 마지막 페이지 번호 추출
+    html = await page.content()
+    soup = BeautifulSoup(html, "html.parser")
     last_btn = soup.select_one('.btn_page_num[data-role="last"]')
     if last_btn and last_btn.text.strip().isdigit():
         last_page = int(last_btn.text.strip())
     else:
         last_page = 1
-    print(f"🔎 총 페이지 수: {last_page}")
+    print(f"🔎 전체 페이지 수: {last_page}")
 
-    # 이미지 폴더 생성 (분류별)
-    image_dir = f'images/{field_code}'
-    os.makedirs(image_dir, exist_ok=True)
+    # ✅ 4. 전체 페이지 순회하며 이미지 다운로드
+    for page_num in range(1, last_page + 1):
+        print(f"▶ 페이지 {page_num} 이미지 크롤링 중...")
+        await page.goto(base_url.format(page=page_num))
+        await page.wait_for_timeout(5000)
 
-    # 데이터 수집
-    data = []
-
-    for page in range(1, last_page + 1):
-        print(f"▶ 페이지 {page} 크롤링 중...")
-        driver.get(base_url.format(page=page))
-        time.sleep(5)
-        soup = BeautifulSoup(driver.page_source, 'html.parser')
-        items = soup.select('.prod_item')
+        html = await page.content()
+        soup = BeautifulSoup(html, "html.parser")
+        items = soup.select(".prod_item")
 
         for item in items:
             try:
-                link_number = item.find('a', class_="prod_link")['href'].split("/")[-1].strip()
-                title = item.find('span', class_="prod_name").get_text(strip=True)
-                labels = item.find('span', class_="prod_label")
-                if labels:
-                    for label in labels:
-                        title = title.replace(label.text.strip(), '')
+                link = item.find("a", class_="prod_link")
+                if not link:
+                    continue
+                book_id = link["href"].split("/")[-1].strip()
 
-                author_tag = item.find('span', class_="prod_author")
-                if author_tag:
-                    author_link = author_tag.find('a')
-                    author = author_link.text.strip() if author_link else author_tag.text.strip()
-                    if not author:
-                        author = ""
-                else:
-                    author = ""
-
-                raw_intro = item.select_one('.prod_introduction')
-                if raw_intro:
-                    intro_clean = raw_intro.text.strip().replace('\n', ' ').replace('\r', ' ')
-                    intro_truncated = (intro_clean[:100] + '...') if len(intro_clean) > 100 else intro_clean
-                else:
-                    intro_truncated = ""
-
-                review_tag = item.select_one('.review_klover_text')
-                review = float(review_tag.text.strip()) if review_tag else None
-
-                # 이미지 저장
-                img_tag = item.select_one('.img_box img')
+                img_tag = item.select_one(".img_box img")
                 if img_tag:
-                    img_url = img_tag.get('src') or img_tag.get('data-src')
+                    img_url = img_tag.get("src") or img_tag.get("data-src")
                     if img_url:
                         img_data = requests.get(img_url).content
-                        with open(f'{image_dir}/{link_number}.jpg', 'wb') as f:
+                        with open(f"{image_dir}/{book_id}.jpg", "wb") as f:
                             f.write(img_data)
-
-                # 데이터 저장
-                data.append((link_number, title, author, intro_truncated, review))
-
             except Exception as e:
-                print(f"[❗오류] {e}")
+                print(f"[❗ 이미지 저장 오류] {e}")
                 continue
 
-    # 분류별 CSV 저장
-    df = pd.DataFrame(data, columns=['Num', 'Title', 'Author', 'Introduction', 'Review'])
-    df.to_csv(f'meta_data/books_{field_code}.csv', index=False, encoding='utf-8-sig')
-    print(f"✅ 저장 완료: meta_data/books_{field_code}.csv")
+    await context.close()
 
-driver.quit()
-print("🎉 전체 크롤링 완료")
+async def main():
+    # 폴더 생성
+    os.makedirs("images", exist_ok=True)
+    os.makedirs("excel_data", exist_ok=True)
+
+    # 분류코드 목록 로딩
+    with open("field_list.txt", "r", encoding="utf-8") as f:
+        field_codes = [line.strip() for line in f if line.strip()]
+
+    # 브라우저 실행
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=False)
+        for field_code in field_codes:
+            await crawl_category(field_code, browser, "excel_data")
+        await browser.close()
+
+    print("\n🎉 전체 작업 완료!")
+
+# 실행
+asyncio.run(main())
+
